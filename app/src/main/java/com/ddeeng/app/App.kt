@@ -263,18 +263,22 @@ object CameraRepo {
     fun load(ctx: Context) {
         if (ready) return
         try {
-            // cameras.csv 하나 또는 cameras1.csv~cameras9.csv 분할본을 모두 합쳐 읽는다
-            val names = ctx.assets.list("")?.filter {
-                it == "cameras.csv" || Regex("cameras[1-9]\\.csv").matches(it)
-            }?.sorted() ?: emptyList()
-            require(names.isNotEmpty()) { "cameras*.csv 파일이 없습니다" }
+            // assets 폴더의 .csv 파일이면 이름과 무관하게 전부 읽어 합친다
+            val names = ctx.assets.list("")
+                ?.filter { it.lowercase().endsWith(".csv") }
+                ?.sorted() ?: emptyList()
+            require(names.isNotEmpty()) { "assets 폴더에 csv 파일이 없습니다" }
+
             val sb = StringBuilder()
-            for ((idx, name) in names.withIndex()) {
+            var first = true
+            for (name in names) {
                 var t = readSmart(ctx.assets.open(name).use { it.readBytes() })
-                if (idx > 0) {                       // 두 번째 파일부터는 헤더 줄 제거
+                if (t.isBlank()) continue
+                if (!first) {                      // 두 번째 파일부터는 헤더 줄 제거
                     val nl = t.indexOf('\n')
                     if (nl >= 0) t = t.substring(nl + 1)
                 }
+                first = false
                 sb.append(t)
                 if (!t.endsWith("\n")) sb.append('\n')
             }
