@@ -54,7 +54,7 @@ object Prefs {
 
     /** 알림 여유 배율(%) — 70 짧게 / 100 보통 / 140 길게 */
     var marginPct: Int get() = i("margin", 100); set(v) = put("margin", v)
-    var coneDeg: Int get() = i("cone", 90);     set(v) = put("cone", v)
+    var coneDeg: Int get() = i("cone", 50);     set(v) = put("cone", v)
     /** 보호구역 카메라 알림 여부 */
     var protectOn: Boolean get() = i("protect", 1) == 1
         set(v) = put("protect", if (v) 1 else 0)
@@ -480,13 +480,25 @@ class LocationService : Service() {
         return START_STICKY
     }
 
-    private var lastBearing: Double? = null   // 마지막 유효 진행 방향
+    private var lastBearing: Double? = null   // 최근 위치들을 평균한 안정화 진행 방향
+    private val bearingHistory = ArrayDeque<Double>()
     private var lastDingAt = 0L               // 전역 알림 간격
     private var armed = false                 // 시속 15km를 한 번이라도 넘겨야 알림 시작
     private var seeded = false                // 첫 위치에서 이미 범위 안이던 카메라는 건너뜀
     private var prevLa = Double.NaN           // 직전 위치 — 진행 방향 직접 계산용
     private var prevLn = Double.NaN
     private val approaching = HashMap<String, Double>()   // 카메라별 직전 거리
+
+    private fun rememberBearing(value: Double) {
+        bearingHistory.addLast((value + 360.0) % 360.0)
+        while (bearingHistory.size > 5) bearingHistory.removeFirst()
+        var x = 0.0; var y = 0.0
+        for (b in bearingHistory) {
+            val r = Math.toRadians(b)
+            x += cos(r); y += sin(r)
+        }
+        if (x != 0.0 || y != 0.0) lastBearing = (Math.toDegrees(atan2(y, x)) + 360.0) % 360.0
+    }
 
     /** 제한속도별 기준 거리 — 도로 종류와 무관하게 비슷한 여유 시간을 준다 */
     private fun baseRadius(limit: Int): Double = when {
@@ -506,11 +518,11 @@ class LocationService : Service() {
 
         // 진행 방향: 기기가 주면 쓰고, 안 주면 좌표 변화로 직접 계산
         if (loc.hasBearing() && speedKmh > 15) {
-            lastBearing = loc.bearing.toDouble()
+            rememberBearing(loc.bearing.toDouble())
             prevLa = la; prevLn = ln
         } else if (!prevLa.isNaN()) {
             if (CameraRepo.distanceM(prevLa, prevLn, la, ln) >= 12.0) {
-                lastBearing = CameraRepo.bearing(prevLa, prevLn, la, ln)
+                rememberBearing(CameraRepo.bearing(prevLa, prevLn, la, ln))
                 prevLa = la; prevLn = ln
             }
         } else {
@@ -520,7 +532,8 @@ class LocationService : Service() {
         val now = System.currentTimeMillis()
         val margin = Prefs.marginPct / 100.0
         val scan = 500.0 * margin          // 격자 탐색 반경
-        val cone = Prefs.coneDeg
+        // V4는 오알림 방지가 우선이다. 설정값이 과거 버전의 90/360으로 남아 있어도 최대 ±25°로 제한한다.
+        val cone = Prefs.coneDeg.coerceIn(30, 50)
 
         // 첫 위치 확정 시, 이미 범위 안에 있던 카메라는 울리지 않게 표시해 둔다
         if (!seeded) {
@@ -542,22 +555,27 @@ class LocationService : Service() {
 
             val key = "%.5f,%.5f".format(c.lat, c.lng)
 
-            // 방향 필터 — 방향을 모르면 아예 울리지 않는다 (반대편 오알림 차단)
+            // V4 방향 필터: 전방 각도 + 진행선 횡거리 + 카메라 단속방향을 함께 검사한다.
             val lb = lastBearing
-            var aligned = when {
-                cone >= 360 -> true
-                lb != null -> CameraRepo.angleDiff(
-                    CameraRepo.bearing(la, ln, c.lat, c.lng), lb) <= cone / 2.0
-                else -> false
-            }
-            // 이 카메라가 감시하는 도로 방향을 아는 경우, 내 진행 방향과 맞아야 한다
+            val toCamera = CameraRepo.bearing(la, ln, c.lat, c.lng)
+            val diff = if (lb != null) CameraRepo.angleDiff(toCamera, lb) else 180.0
+            val angleRad = Math.toRadians(diff)
+            val forwardM = d * cos(angleRad)
+            val lateralM = abs(d * sin(angleRad))
+
+            var aligned = lb != null &&
+                    diff <= cone / 2.0 &&
+                    forwardM > 0.0 &&
+                    lateralM <= 35.0
+
+            // 방위 데이터가 있는 카메라는 차량 진행방향과 더 엄격하게 대조한다.
             if (aligned && c.brg >= 0 && lb != null)
-                aligned = CameraRepo.angleDiff(c.brg.toDouble(), lb) <= 75.0
+                aligned = CameraRepo.angleDiff(c.brg.toDouble(), lb) <= 35.0
 
             // 접근 중인지 — 거리가 줄지 않으면 지나쳤거나 반대편이다
             val before = approaching[key]
             approaching[key] = d
-            val closing = before == null || d < before - 1.0
+            val closing = before == null || d < before - 1.5
 
             if (aligned && d < bestD) { bestD = d; best = c }
 
@@ -603,6 +621,7 @@ class LocationService : Service() {
         running = false; speedKmh = -1; statusText = "정지됨"; nearAlert = false
         armed = false; seeded = false; lastBearing = null; lastDingAt = 0L
         prevLa = Double.NaN; prevLn = Double.NaN
+        bearingHistory.clear()
         cooldown.clear(); approaching.clear()
         try { fused.removeLocationUpdates(cb) } catch (_: Exception) {}
         try { unregisterReceiver(btRx) } catch (_: Exception) {}
@@ -845,7 +864,7 @@ class MainActivity : Activity() {
 class SettingsActivity : Activity() {
 
     private val marginValues = listOf(70, 100, 140)
-    private val coneValues = listOf(360, 90, 60)
+    private val coneValues = listOf(50, 40, 30)
     private val countValues = listOf(1, 2, 3)
     private var btAddrs: List<String> = listOf("")
 
@@ -890,11 +909,11 @@ class SettingsActivity : Activity() {
 
         // 진행 방향
         body.addView(sec("진행 방향 판정"))
-        body.addView(spinner(listOf("전부 알림", "앞쪽만 (±45°)", "엄격 (±30°)"),
+        body.addView(spinner(listOf("기본 (±25°)", "정밀 (±20°)", "매우 엄격 (±15°)"),
             coneValues.indexOf(Prefs.coneDeg).coerceAtLeast(0)) {
             Prefs.coneDeg = coneValues[it]
         })
-        body.addView(hint("반대편 도로의 카메라를 걸러냅니다 (시속 15km 이상일 때)"))
+        body.addView(hint("V4는 진행방향과 좌우 이탈거리 35m를 함께 검사해 반대편·평행도로 카메라를 걸러냅니다."))
 
         // 보호구역 카메라
         body.addView(sec("보호구역 카메라"))
