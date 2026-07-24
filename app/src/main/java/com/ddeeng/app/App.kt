@@ -250,8 +250,15 @@ object SoundEngine {
 /* ==========================================================
    카메라 데이터 (앱에 내장된 CSV)
    ========================================================== */
-data class Cam(val lat: Double, val lng: Double, val limit: Int, val kind: String,
-               val brg: Int = -1)   // 카메라가 감시하는 도로 방위 (-1 = 모름)
+data class Cam(
+    val lat: Double,
+    val lng: Double,
+    val limit: Int,
+    val kind: String,
+    val directionType: String = "unknown", // oneway / bidirectional / unknown
+    val brg: Int = -1,                     // 첫 번째 단속 진행방위
+    val brg2: Int = -1                     // 두 번째 단속 진행방위
+)
 
 object CameraRepo {
     private const val CELL = 0.01
@@ -328,9 +335,18 @@ object CameraRepo {
     }
 
     private fun readSmart(b: ByteArray): String {
-        val euc = try { String(b, charset("EUC-KR")) } catch (e: Exception) { "" }
-        return if (euc.isEmpty() || euc.take(400).contains('\uFFFD'))
-            String(b, Charsets.UTF_8) else euc
+        // 새 방향 CSV는 UTF-8 BOM 형식이다. UTF-8을 먼저 엄격하게 검사하고,
+        // 실패할 때만 국내 공공데이터에서 흔한 EUC-KR로 읽는다.
+        if (b.size >= 3 && b[0] == 0xEF.toByte() && b[1] == 0xBB.toByte() && b[2] == 0xBF.toByte())
+            return String(b, 3, b.size - 3, Charsets.UTF_8)
+        return try {
+            val decoder = Charsets.UTF_8.newDecoder()
+            decoder.onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+            decoder.onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+            decoder.decode(java.nio.ByteBuffer.wrap(b)).toString()
+        } catch (_: Exception) {
+            String(b, charset("EUC-KR"))
+        }
     }
 
     private fun splitLine(l: String): List<String> {
@@ -363,9 +379,11 @@ object CameraRepo {
         val iLat = findCol(hdr, listOf("위도", "latitude", "lat"))
         val iLng = findCol(hdr, listOf("경도", "longitude", "lng", "lon"))
         require(iLat >= 0 && iLng >= 0) { "위도·경도 열이 없습니다." }
-        val iLim = findCol(hdr, listOf("제한속도", "속도"))
-        val iKind = findCol(hdr, listOf("단속구분", "단속종류", "시설종류"))
-        val iBrg = findCol(hdr, listOf("방위"))
+        val iLim = findCol(hdr, listOf("제한속도", "속도", "speed"))
+        val iKind = findCol(hdr, listOf("단속구분", "단속종류", "시설종류", "type"))
+        val iDirType = findCol(hdr, listOf("direction_type", "방향유형"))
+        val iBrg = findCol(hdr, listOf("bearing", "방위"))
+        val iBrg2 = findCol(hdr, listOf("bearing2", "방위2"))
 
         val list = ArrayList<Cam>(lines.size)
         for (k in 1 until lines.size) {
@@ -375,10 +393,20 @@ object CameraRepo {
             if (la < 32.0 || la > 39.8 || ln < 124.0 || ln > 132.2) continue
             val kind = if (iKind >= 0) c.getOrElse(iKind) { "" }.replace("\"", "") else ""
             if (Regex("주정차|주차").containsMatchIn(kind)) continue
-            val brg = if (iBrg >= 0) (c.getOrNull(iBrg)?.trim()?.toIntOrNull() ?: -1) else -1
-            list.add(Cam(la, ln,
+            val directionType = if (iDirType >= 0)
+                c.getOrNull(iDirType)?.trim()?.lowercase().orEmpty() else "unknown"
+            val brg = if (iBrg >= 0)
+                c.getOrNull(iBrg)?.trim()?.toDoubleOrNull()?.roundToInt() ?: -1 else -1
+            val brg2 = if (iBrg2 >= 0)
+                c.getOrNull(iBrg2)?.trim()?.toDoubleOrNull()?.roundToInt() ?: -1 else -1
+            list.add(Cam(
+                la, ln,
                 if (iLim >= 0) c.getOrNull(iLim)?.trim()?.toIntOrNull() ?: 0 else 0,
-                kind, if (brg in 0..359) brg else -1))
+                kind,
+                if (directionType in setOf("oneway", "bidirectional")) directionType else "unknown",
+                if (brg in 0..359) brg else -1,
+                if (brg2 in 0..359) brg2 else -1
+            ))
         }
         require(list.isNotEmpty()) { "유효한 좌표가 없습니다." }
         cams = list
@@ -568,9 +596,14 @@ class LocationService : Service() {
                     forwardM > 0.0 &&
                     lateralM <= 35.0
 
-            // 방위 데이터가 있는 카메라는 차량 진행방향과 더 엄격하게 대조한다.
-            if (aligned && c.brg >= 0 && lb != null)
-                aligned = CameraRepo.angleDiff(c.brg.toDouble(), lb) <= 35.0
+            // V4.1 방향 데이터 적용:
+            // 단방향 카메라는 저장된 단속 진행방위와 차량 진행방향이 맞을 때만 허용한다.
+            // 양방향은 전방·횡거리 조건만 통과하면 되고, 미확정은 기존 보수 필터를 쓴다.
+            if (aligned && c.directionType == "oneway" && lb != null) {
+                val match1 = c.brg >= 0 && CameraRepo.angleDiff(c.brg.toDouble(), lb) <= 30.0
+                val match2 = c.brg2 >= 0 && CameraRepo.angleDiff(c.brg2.toDouble(), lb) <= 30.0
+                aligned = match1 || match2
+            }
 
             // 접근 중인지 — 거리가 줄지 않으면 지나쳤거나 반대편이다
             val before = approaching[key]
