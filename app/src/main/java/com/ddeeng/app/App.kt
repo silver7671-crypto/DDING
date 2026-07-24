@@ -55,6 +55,9 @@ object Prefs {
     /** 알림 여유 배율(%) — 70 짧게 / 100 보통 / 140 길게 */
     var marginPct: Int get() = i("margin", 100); set(v) = put("margin", v)
     var coneDeg: Int get() = i("cone", 90);     set(v) = put("cone", v)
+    /** 보호구역 카메라 알림 여부 */
+    var protectOn: Boolean get() = i("protect", 1) == 1
+        set(v) = put("protect", if (v) 1 else 0)
     var instrument: String get() = s("inst", "bell"); set(v) = put("inst", v)
     var freq1: Int   get() = i("f1", 1568);     set(v) = put("f1", v)
     var freq2: Int   get() = i("f2", 1376);     set(v) = put("f2", v)
@@ -247,7 +250,8 @@ object SoundEngine {
 /* ==========================================================
    카메라 데이터 (앱에 내장된 CSV)
    ========================================================== */
-data class Cam(val lat: Double, val lng: Double, val limit: Int, val kind: String)
+data class Cam(val lat: Double, val lng: Double, val limit: Int, val kind: String,
+               val brg: Int = -1)   // 카메라가 감시하는 도로 방위 (-1 = 모름)
 
 object CameraRepo {
     private const val CELL = 0.01
@@ -361,6 +365,7 @@ object CameraRepo {
         require(iLat >= 0 && iLng >= 0) { "위도·경도 열이 없습니다." }
         val iLim = findCol(hdr, listOf("제한속도", "속도"))
         val iKind = findCol(hdr, listOf("단속구분", "단속종류", "시설종류"))
+        val iBrg = findCol(hdr, listOf("방위"))
 
         val list = ArrayList<Cam>(lines.size)
         for (k in 1 until lines.size) {
@@ -370,8 +375,10 @@ object CameraRepo {
             if (la < 32.0 || la > 39.8 || ln < 124.0 || ln > 132.2) continue
             val kind = if (iKind >= 0) c.getOrElse(iKind) { "" }.replace("\"", "") else ""
             if (Regex("주정차|주차").containsMatchIn(kind)) continue
+            val brg = if (iBrg >= 0) (c.getOrNull(iBrg)?.trim()?.toIntOrNull() ?: -1) else -1
             list.add(Cam(la, ln,
-                if (iLim >= 0) c.getOrNull(iLim)?.trim()?.toIntOrNull() ?: 0 else 0, kind))
+                if (iLim >= 0) c.getOrNull(iLim)?.trim()?.toIntOrNull() ?: 0 else 0,
+                kind, if (brg in 0..359) brg else -1))
         }
         require(list.isNotEmpty()) { "유효한 좌표가 없습니다." }
         cams = list
@@ -477,6 +484,9 @@ class LocationService : Service() {
     private var lastDingAt = 0L               // 전역 알림 간격
     private var armed = false                 // 시속 15km를 한 번이라도 넘겨야 알림 시작
     private var seeded = false                // 첫 위치에서 이미 범위 안이던 카메라는 건너뜀
+    private var prevLa = Double.NaN           // 직전 위치 — 진행 방향 직접 계산용
+    private var prevLn = Double.NaN
+    private val approaching = HashMap<String, Double>()   // 카메라별 직전 거리
 
     /** 제한속도별 기준 거리 — 도로 종류와 무관하게 비슷한 여유 시간을 준다 */
     private fun baseRadius(limit: Int): Double = when {
@@ -492,8 +502,20 @@ class LocationService : Service() {
     private fun onLoc(loc: Location) {
         val la = loc.latitude; val ln = loc.longitude
         speedKmh = if (loc.hasSpeed() && loc.speed >= 0) (loc.speed * 3.6).toInt() else -1
-        if (loc.hasBearing() && speedKmh > 15) lastBearing = loc.bearing.toDouble()
         if (speedKmh > 15) armed = true            // 한 번 출발하면 계속 유효
+
+        // 진행 방향: 기기가 주면 쓰고, 안 주면 좌표 변화로 직접 계산
+        if (loc.hasBearing() && speedKmh > 15) {
+            lastBearing = loc.bearing.toDouble()
+            prevLa = la; prevLn = ln
+        } else if (!prevLa.isNaN()) {
+            if (CameraRepo.distanceM(prevLa, prevLn, la, ln) >= 12.0) {
+                lastBearing = CameraRepo.bearing(prevLa, prevLn, la, ln)
+                prevLa = la; prevLn = ln
+            }
+        } else {
+            prevLa = la; prevLn = ln
+        }
 
         val now = System.currentTimeMillis()
         val margin = Prefs.marginPct / 100.0
@@ -509,26 +531,45 @@ class LocationService : Service() {
             seeded = true
         }
 
+        val protectOn = Prefs.protectOn
         var best: Cam? = null; var bestD = Double.MAX_VALUE
+
         for (c in CameraRepo.nearby(la, ln, scan)) {
+            if (!protectOn && c.kind.contains("보호구역")) continue   // 보호구역 알림 끔
+
             val d = CameraRepo.distanceM(la, ln, c.lat, c.lng)
             if (d > effRadius(c.limit, margin)) continue
-            val lb = lastBearing
-            if (cone < 360 && lb != null) {
-                val br = CameraRepo.bearing(la, ln, c.lat, c.lng)
-                if (CameraRepo.angleDiff(br, lb) > cone / 2.0) continue
-            }
-            if (d < bestD) { bestD = d; best = c }
 
             val key = "%.5f,%.5f".format(c.lat, c.lng)
+
+            // 방향 필터 — 방향을 모르면 아예 울리지 않는다 (반대편 오알림 차단)
+            val lb = lastBearing
+            var aligned = when {
+                cone >= 360 -> true
+                lb != null -> CameraRepo.angleDiff(
+                    CameraRepo.bearing(la, ln, c.lat, c.lng), lb) <= cone / 2.0
+                else -> false
+            }
+            // 이 카메라가 감시하는 도로 방향을 아는 경우, 내 진행 방향과 맞아야 한다
+            if (aligned && c.brg >= 0 && lb != null)
+                aligned = CameraRepo.angleDiff(c.brg.toDouble(), lb) <= 75.0
+
+            // 접근 중인지 — 거리가 줄지 않으면 지나쳤거나 반대편이다
+            val before = approaching[key]
+            approaching[key] = d
+            val closing = before == null || d < before - 1.0
+
+            if (aligned && d < bestD) { bestD = d; best = c }
+
             val slow = speedKmh in 0 until 20          // 정체·정지 중엔 무음
-            if (armed && !slow &&
+            if (aligned && closing && armed && !slow &&
                 now - (cooldown[key] ?: 0L) > 300_000 && now - lastDingAt > 8_000) {
                 cooldown[key] = now
                 lastDingAt = now
                 SoundEngine.play()
             }
         }
+        if (approaching.size > 800) approaching.clear()
         if (cooldown.size > 600) cooldown.entries.removeAll { now - it.value > 600_000 }
 
         nearAlert = best != null
@@ -560,6 +601,9 @@ class LocationService : Service() {
 
     override fun onDestroy() {
         running = false; speedKmh = -1; statusText = "정지됨"; nearAlert = false
+        armed = false; seeded = false; lastBearing = null; lastDingAt = 0L
+        prevLa = Double.NaN; prevLn = Double.NaN
+        cooldown.clear(); approaching.clear()
         try { fused.removeLocationUpdates(cb) } catch (_: Exception) {}
         try { unregisterReceiver(btRx) } catch (_: Exception) {}
         super.onDestroy()
@@ -851,6 +895,13 @@ class SettingsActivity : Activity() {
             Prefs.coneDeg = coneValues[it]
         })
         body.addView(hint("반대편 도로의 카메라를 걸러냅니다 (시속 15km 이상일 때)"))
+
+        // 보호구역 카메라
+        body.addView(sec("보호구역 카메라"))
+        body.addView(spinner(listOf("알림", "끄기"), if (Prefs.protectOn) 0 else 1) {
+            Prefs.protectOn = (it == 0)
+        })
+        body.addView(hint("어린이·노인 보호구역 카메라 14,368곳. 이면도로에 촘촘해 오알림이 잦으면 끄세요."))
 
         // 악기
         val instKeys = SoundEngine.INSTRUMENTS.keys.toList()
