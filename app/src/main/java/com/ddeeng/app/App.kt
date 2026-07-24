@@ -52,7 +52,8 @@ object Prefs {
     private fun put(k: String, v: Int) = sp.edit().putInt(k, v).apply()
     private fun put(k: String, v: String) = sp.edit().putString(k, v).apply()
 
-    var radiusM: Int get() = i("radius", 500);  set(v) = put("radius", v)
+    /** 알림 여유 배율(%) — 70 짧게 / 100 보통 / 140 길게 */
+    var marginPct: Int get() = i("margin", 100); set(v) = put("margin", v)
     var coneDeg: Int get() = i("cone", 90);     set(v) = put("cone", v)
     var instrument: String get() = s("inst", "bell"); set(v) = put("inst", v)
     var freq1: Int   get() = i("f1", 1568);     set(v) = put("f1", v)
@@ -260,14 +261,36 @@ object CameraRepo {
     private fun cellKey(la: Double, ln: Double): Long =
         (Math.round(la / CELL) shl 22) xor (Math.round(ln / CELL) and 0x3FFFFFL)
 
+    /** assets 안을 하위 폴더까지 뒤져 csv 경로를 모은다. */
+    private fun scanCsv(ctx: Context, dir: String, depth: Int, found: MutableList<String>,
+                        seen: MutableList<String>) {
+        if (depth > 3) return
+        val entries = try { ctx.assets.list(dir) ?: return } catch (e: Exception) { return }
+        for (e in entries) {
+            val path = if (dir.isEmpty()) e else "$dir/$e"
+            if (e.lowercase().endsWith(".csv")) {
+                found.add(path)
+            } else {
+                if (seen.size < 25) seen.add(path)
+                // 안드로이드 기본 폴더는 건너뛴다
+                if (e !in listOf("images", "webkit", "sounds", "fonts"))
+                    scanCsv(ctx, path, depth + 1, found, seen)
+            }
+        }
+    }
+
     fun load(ctx: Context) {
         if (ready) return
         try {
-            // assets 폴더의 .csv 파일이면 이름과 무관하게 전부 읽어 합친다
-            val names = ctx.assets.list("")
-                ?.filter { it.lowercase().endsWith(".csv") }
-                ?.sorted() ?: emptyList()
-            require(names.isNotEmpty()) { "assets 폴더에 csv 파일이 없습니다" }
+            val names = ArrayList<String>()
+            val seen = ArrayList<String>()
+            scanCsv(ctx, "", 0, names, seen)
+            names.sort()
+
+            require(names.isNotEmpty()) {
+                if (seen.isEmpty()) "assets 폴더가 비어 있습니다"
+                else "csv를 찾지 못했습니다. assets 안에 있는 것: " + seen.joinToString(", ")
+            }
 
             val sb = StringBuilder()
             var first = true
@@ -455,13 +478,16 @@ class LocationService : Service() {
     private var armed = false                 // 시속 15km를 한 번이라도 넘겨야 알림 시작
     private var seeded = false                // 첫 위치에서 이미 범위 안이던 카메라는 건너뜀
 
-    /** 제한속도별 실효 알림 거리 — 옆길 스쿨존 오알림 방지 */
-    private fun effRadius(limit: Int, userRadius: Double): Double = when {
-        limit >= 80 -> userRadius
-        limit >= 60 -> min(userRadius, 400.0)
-        limit >= 50 -> min(userRadius, 300.0)
-        else -> min(userRadius, 180.0)
+    /** 제한속도별 기준 거리 — 도로 종류와 무관하게 비슷한 여유 시간을 준다 */
+    private fun baseRadius(limit: Int): Double = when {
+        limit >= 80 -> 500.0
+        limit >= 60 -> 400.0
+        limit >= 50 -> 300.0
+        else -> 180.0            // 스쿨존 등 저속 도로
     }
+
+    /** 기준 거리에 사용자가 고른 여유 배율을 곱한다 */
+    private fun effRadius(limit: Int, margin: Double): Double = baseRadius(limit) * margin
 
     private fun onLoc(loc: Location) {
         val la = loc.latitude; val ln = loc.longitude
@@ -470,22 +496,23 @@ class LocationService : Service() {
         if (speedKmh > 15) armed = true            // 한 번 출발하면 계속 유효
 
         val now = System.currentTimeMillis()
-        val radius = Prefs.radiusM.toDouble()
+        val margin = Prefs.marginPct / 100.0
+        val scan = 500.0 * margin          // 격자 탐색 반경
         val cone = Prefs.coneDeg
 
         // 첫 위치 확정 시, 이미 범위 안에 있던 카메라는 울리지 않게 표시해 둔다
         if (!seeded) {
-            for (c in CameraRepo.nearby(la, ln, radius)) {
-                if (CameraRepo.distanceM(la, ln, c.lat, c.lng) <= effRadius(c.limit, radius))
+            for (c in CameraRepo.nearby(la, ln, scan)) {
+                if (CameraRepo.distanceM(la, ln, c.lat, c.lng) <= effRadius(c.limit, margin))
                     cooldown["%.5f,%.5f".format(c.lat, c.lng)] = now
             }
             seeded = true
         }
 
         var best: Cam? = null; var bestD = Double.MAX_VALUE
-        for (c in CameraRepo.nearby(la, ln, radius)) {
+        for (c in CameraRepo.nearby(la, ln, scan)) {
             val d = CameraRepo.distanceM(la, ln, c.lat, c.lng)
-            if (d > effRadius(c.limit, radius)) continue
+            if (d > effRadius(c.limit, margin)) continue
             val lb = lastBearing
             if (cone < 360 && lb != null) {
                 val br = CameraRepo.bearing(la, ln, c.lat, c.lng)
@@ -773,7 +800,7 @@ class MainActivity : Activity() {
    ========================================================== */
 class SettingsActivity : Activity() {
 
-    private val radiusValues = listOf(300, 500, 800)
+    private val marginValues = listOf(70, 100, 140)
     private val coneValues = listOf(360, 90, 60)
     private val countValues = listOf(1, 2, 3)
     private var btAddrs: List<String> = listOf("")
@@ -803,12 +830,19 @@ class SettingsActivity : Activity() {
             setTextColor(C.MUTE); textSize = 13f
         })
 
-        // 알림 거리
-        body.addView(sec("알림 거리"))
-        body.addView(spinner(radiusValues.map { "$it m" },
-            radiusValues.indexOf(Prefs.radiusM).coerceAtLeast(0)) {
-            Prefs.radiusM = radiusValues[it]
+        // 알림 여유
+        body.addView(sec("알림 여유"))
+        val marginHint = TextView(this).apply {
+            setTextColor(0xFF5C6F7D.toInt()); textSize = 11f
+            setPadding(0, dp(5), 0, 0)
+            text = marginText(Prefs.marginPct)
+        }
+        body.addView(spinner(listOf("짧게", "보통", "길게"),
+            marginValues.indexOf(Prefs.marginPct).coerceAtLeast(1)) {
+            Prefs.marginPct = marginValues[it]
+            marginHint.text = marginText(Prefs.marginPct)
         })
+        body.addView(marginHint)
 
         // 진행 방향
         body.addView(sec("진행 방향 판정"))
@@ -866,6 +900,12 @@ class SettingsActivity : Activity() {
     }
 
     // ---------- 조각 ----------
+    private fun marginText(pct: Int): String {
+        val m = pct / 100.0
+        fun r(x: Int) = Math.round(x * m).toInt()
+        return "고속 ${r(500)}m · 국도 ${r(400)}m · 시내 ${r(300)}m · 스쿨존 ${r(180)}m 앞"
+    }
+
     private fun sec(t: String) = TextView(this).apply {
         text = t; setTextColor(C.MUTE); textSize = 11f; letterSpacing = 0.14f
         setPadding(0, dp(22), 0, dp(7))
