@@ -263,7 +263,22 @@ object CameraRepo {
     fun load(ctx: Context) {
         if (ready) return
         try {
-            parse(readSmart(ctx.assets.open("cameras.csv").use { it.readBytes() }))
+            // cameras.csv 하나 또는 cameras1.csv~cameras9.csv 분할본을 모두 합쳐 읽는다
+            val names = ctx.assets.list("")?.filter {
+                it == "cameras.csv" || Regex("cameras[1-9]\\.csv").matches(it)
+            }?.sorted() ?: emptyList()
+            require(names.isNotEmpty()) { "cameras*.csv 파일이 없습니다" }
+            val sb = StringBuilder()
+            for ((idx, name) in names.withIndex()) {
+                var t = readSmart(ctx.assets.open(name).use { it.readBytes() })
+                if (idx > 0) {                       // 두 번째 파일부터는 헤더 줄 제거
+                    val nl = t.indexOf('\n')
+                    if (nl >= 0) t = t.substring(nl + 1)
+                }
+                sb.append(t)
+                if (!t.endsWith("\n")) sb.append('\n')
+            }
+            parse(sb.toString())
             error = null
         } catch (e: Exception) {
             error = e.message ?: "데이터를 읽지 못했습니다"
@@ -431,30 +446,59 @@ class LocationService : Service() {
         return START_STICKY
     }
 
+    private var lastBearing: Double? = null   // 마지막 유효 진행 방향
+    private var lastDingAt = 0L               // 전역 알림 간격
+    private var armed = false                 // 시속 15km를 한 번이라도 넘겨야 알림 시작
+    private var seeded = false                // 첫 위치에서 이미 범위 안이던 카메라는 건너뜀
+
+    /** 제한속도별 실효 알림 거리 — 옆길 스쿨존 오알림 방지 */
+    private fun effRadius(limit: Int, userRadius: Double): Double = when {
+        limit >= 80 -> userRadius
+        limit >= 60 -> min(userRadius, 400.0)
+        limit >= 50 -> min(userRadius, 300.0)
+        else -> min(userRadius, 180.0)
+    }
+
     private fun onLoc(loc: Location) {
         val la = loc.latitude; val ln = loc.longitude
         speedKmh = if (loc.hasSpeed() && loc.speed >= 0) (loc.speed * 3.6).toInt() else -1
+        if (loc.hasBearing() && speedKmh > 15) lastBearing = loc.bearing.toDouble()
+        if (speedKmh > 15) armed = true            // 한 번 출발하면 계속 유효
+
         val now = System.currentTimeMillis()
         val radius = Prefs.radiusM.toDouble()
         val cone = Prefs.coneDeg
 
+        // 첫 위치 확정 시, 이미 범위 안에 있던 카메라는 울리지 않게 표시해 둔다
+        if (!seeded) {
+            for (c in CameraRepo.nearby(la, ln, radius)) {
+                if (CameraRepo.distanceM(la, ln, c.lat, c.lng) <= effRadius(c.limit, radius))
+                    cooldown["%.5f,%.5f".format(c.lat, c.lng)] = now
+            }
+            seeded = true
+        }
+
         var best: Cam? = null; var bestD = Double.MAX_VALUE
         for (c in CameraRepo.nearby(la, ln, radius)) {
             val d = CameraRepo.distanceM(la, ln, c.lat, c.lng)
-            if (d > radius) continue
-            if (cone < 360 && loc.hasBearing() && speedKmh > 15) {
+            if (d > effRadius(c.limit, radius)) continue
+            val lb = lastBearing
+            if (cone < 360 && lb != null) {
                 val br = CameraRepo.bearing(la, ln, c.lat, c.lng)
-                if (CameraRepo.angleDiff(br, loc.bearing.toDouble()) > cone / 2.0) continue
+                if (CameraRepo.angleDiff(br, lb) > cone / 2.0) continue
             }
             if (d < bestD) { bestD = d; best = c }
 
             val key = "%.5f,%.5f".format(c.lat, c.lng)
-            if (now - (cooldown[key] ?: 0L) > 90_000) {
+            val slow = speedKmh in 0 until 20          // 정체·정지 중엔 무음
+            if (armed && !slow &&
+                now - (cooldown[key] ?: 0L) > 300_000 && now - lastDingAt > 8_000) {
                 cooldown[key] = now
+                lastDingAt = now
                 SoundEngine.play()
             }
         }
-        if (cooldown.size > 400) cooldown.entries.removeAll { now - it.value > 300_000 }
+        if (cooldown.size > 600) cooldown.entries.removeAll { now - it.value > 600_000 }
 
         nearAlert = best != null
         statusText = best?.let {
@@ -600,8 +644,8 @@ class MainActivity : Activity() {
         }
         center.addView(speedView)
         center.addView(TextView(this).apply {
-            text = "KM / H"; setTextColor(C.MUTE); textSize = 13f
-            letterSpacing = 0.3f; gravity = Gravity.CENTER
+            text = "km/h"; setTextColor(C.MUTE); textSize = 13f
+            letterSpacing = 0.2f; gravity = Gravity.CENTER
             setPadding(0, dp(6), 0, 0)
         })
         statusView = TextView(this).apply {
